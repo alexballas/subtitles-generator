@@ -1,6 +1,6 @@
 # Video Subtitle Generator
 
-This script generates precise, aligned `.srt` subtitles for video files using `whisperx`.
+This script generates `.srt` subtitles using Qwen3-ASR-1.7B for transcription and Qwen3-ForcedAligner-0.6B for word-level timing. The spoken language is detected automatically. Audio is processed in 60-second chunks to keep long videos within GPU memory and preserve local timing. WhisperX remains available for audio loading and fallback alignment.
 
 ## Prerequisites
 
@@ -41,6 +41,8 @@ By default, the script attempts to use the GPU (`cuda`) and `float16` precision.
 ```bash
 ./run.sh /path/to/video.mp4 --compute_type int8
 ```
+
+The default GPU path uses bfloat16 for Qwen3-ASR and its forced aligner. The first run downloads both Qwen model checkpoints. `--compute_type float32` forces float32 when needed.
 
 View the help menu for all options:
 ```bash

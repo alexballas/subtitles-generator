@@ -1,21 +1,10 @@
 import whisperx
+import re
 import gc
 import os
 import torch
+from qwen_asr import Qwen3ASRModel
 from typing import List, Dict
-
-DEFAULT_ASR_OPTIONS = {
-    # Reduces runaway text continuation and silence hallucinations.
-    "condition_on_previous_text": False,
-}
-
-DEFAULT_VAD_OPTIONS = {
-    # Balanced defaults for mixed movie audio: stricter than WhisperX defaults
-    # without being so aggressive that quiet dialogue gets clipped too often.
-    "vad_onset": 0.58,
-    "vad_offset": 0.35,
-    "chunk_size": 20,
-}
 
 _original_torch_load = torch.load
 
@@ -24,6 +13,167 @@ def _trusted_load(*args, **kwargs):
     return _original_torch_load(*args, **kwargs)
 
 torch.load = _trusted_load
+
+QWEN_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
+QWEN_FORCED_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
+QWEN_SAMPLE_RATE = 16000
+QWEN_CHUNK_SECONDS = 60
+QWEN_MAX_NEW_TOKENS = 2048
+QWEN_TO_WHISPER_LANGUAGE = {
+    "chinese": "zh",
+    "english": "en",
+    "cantonese": "zh",
+    "arabic": "ar",
+    "german": "de",
+    "french": "fr",
+    "spanish": "es",
+    "portuguese": "pt",
+    "indonesian": "id",
+    "italian": "it",
+    "korean": "ko",
+    "russian": "ru",
+    "thai": "th",
+    "vietnamese": "vi",
+    "japanese": "ja",
+    "turkish": "tr",
+    "hindi": "hi",
+    "malay": "ms",
+    "dutch": "nl",
+    "swedish": "sv",
+    "danish": "da",
+    "finnish": "fi",
+    "polish": "pl",
+    "czech": "cs",
+    "filipino": "tl",
+    "persian": "fa",
+    "greek": "el",
+    "romanian": "ro",
+    "hungarian": "hu",
+    "macedonian": "mk",
+}
+
+
+def _qwen_language_to_whisper_code(language: str) -> str | None:
+    """Convert Qwen's detected language name to WhisperX's ISO code."""
+    if not language:
+        return None
+    parts = [part.strip().lower() for part in re.split(r"[,/]", language) if part.strip()]
+    if len(parts) != 1:
+        return None
+    return QWEN_TO_WHISPER_LANGUAGE.get(parts[0])
+
+
+def _load_qwen_model(device: str, compute_type: str) -> Qwen3ASRModel:
+    dtype = torch.float32 if device == "cpu" or compute_type == "float32" else torch.bfloat16
+    device_map = "cuda:0" if device == "cuda" else "cpu"
+    print(
+        f"Loading Qwen ASR model '{QWEN_ASR_MODEL}' on {device} with dtype={dtype} "
+        f"and forced aligner '{QWEN_FORCED_ALIGNER_MODEL}'..."
+    )
+    return Qwen3ASRModel.from_pretrained(
+        QWEN_ASR_MODEL,
+        dtype=dtype,
+        device_map=device_map,
+        forced_aligner=QWEN_FORCED_ALIGNER_MODEL,
+        forced_aligner_kwargs={"dtype": dtype, "device_map": device_map},
+        max_inference_batch_size=1,
+        max_new_tokens=QWEN_MAX_NEW_TOKENS,
+    )
+
+
+def _normalize_aligned_token(token: str) -> str:
+    return "".join(
+        character
+        for character in token
+        if character.isalnum() or character in "'’"
+    ).casefold()
+
+
+def _restore_transcript_punctuation(words: List[Dict], text: str) -> None:
+    """Put Qwen's punctuation back onto the forced-aligner word spans."""
+    transcript_tokens = text.split()
+    token_index = 0
+
+    for word_info in words:
+        aligned_token = _normalize_aligned_token(word_info["word"])
+        if not aligned_token:
+            continue
+
+        while token_index < len(transcript_tokens):
+            transcript_token = transcript_tokens[token_index]
+            token_index += 1
+            normalized_token = _normalize_aligned_token(transcript_token)
+            if not normalized_token:
+                continue
+
+            if normalized_token == aligned_token:
+                word_info["word"] = transcript_token
+                break
+
+
+def _transcribe_qwen_chunks(model: Qwen3ASRModel, audio) -> tuple[List[Dict], List[str]]:
+    """Transcribe short chunks while leaving Qwen's language detection automatic."""
+    chunk_samples = QWEN_CHUNK_SECONDS * QWEN_SAMPLE_RATE
+    segments = []
+    detected_languages = []
+
+    for chunk_start in range(0, len(audio), chunk_samples):
+        chunk_end = min(chunk_start + chunk_samples, len(audio))
+        start_seconds = chunk_start / QWEN_SAMPLE_RATE
+        end_seconds = chunk_end / QWEN_SAMPLE_RATE
+        print(
+            f"Transcribing Qwen chunk {chunk_start // chunk_samples + 1} "
+            f"({format_time_srt(start_seconds)}–{format_time_srt(end_seconds)})..."
+        )
+
+        transcription = model.transcribe(
+            (audio[chunk_start:chunk_end], QWEN_SAMPLE_RATE),
+            return_time_stamps=True,
+        )
+        if transcription:
+            transcription_result = transcription[0]
+            detected_language = (transcription_result.language or "").strip()
+            text = (transcription_result.text or "").strip()
+            if detected_language:
+                detected_languages.append(detected_language)
+            if text:
+                words = []
+                previous_end = None
+                for item in transcription_result.time_stamps or []:
+                    word = (getattr(item, "text", "") or "").strip()
+                    word_start = float(getattr(item, "start_time", 0.0))
+                    word_end = float(getattr(item, "end_time", 0.0))
+                    if previous_end is not None and word_end <= previous_end:
+                        continue
+                    if previous_end is not None:
+                        word_start = max(word_start, previous_end)
+                    if word and word_end > word_start:
+                        words.append({
+                            "word": word,
+                            "start": start_seconds + word_start,
+                            "end": start_seconds + word_end,
+                        })
+                        previous_end = word_end
+
+                if words:
+                    _restore_transcript_punctuation(words, text)
+                    segments.append({
+                        "start": words[0]["start"],
+                        "end": words[-1]["end"],
+                        "text": text,
+                        "words": words,
+                    })
+                else:
+                    segments.append({
+                        "start": start_seconds,
+                        "end": end_seconds,
+                        "text": text,
+                    })
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return segments, list(dict.fromkeys(detected_languages))
 
 
 def split_by_pauses(segment: Dict, min_pause: float = 0.3, max_duration: float = 5.0, max_chars: int = 80) -> List[Dict]:
@@ -140,33 +290,54 @@ def generate_srt_from_video(video_path: str, output_dir: str | None = None, devi
 
     print(f"Loading audio from: {video_path}")
     audio = whisperx.load_audio(video_path)
+    duration_seconds = len(audio) / QWEN_SAMPLE_RATE
 
-    print(f"Loading whisperx model 'large-v3-turbo' on {device} with compute_type={compute_type}...")
-    print("Using built-in anti-hallucination defaults for VAD and decoding...")
-    model = whisperx.load_model(
-        "large-v3-turbo",
-        device,
-        compute_type=compute_type,
-        asr_options=DEFAULT_ASR_OPTIONS,
-        vad_options=DEFAULT_VAD_OPTIONS,
-    )
+    model = _load_qwen_model(device, compute_type)
 
     print("Transcribing audio...")
-    result = model.transcribe(audio, batch_size=16)
+    segments, detected_languages = _transcribe_qwen_chunks(model, audio)
+    detected_language = ",".join(detected_languages)
+    language_code = None
+    if len(detected_languages) == 1:
+        language_code = _qwen_language_to_whisper_code(detected_languages[0])
 
-    lang = result["language"]
-    print(f"Detected language: {lang}. Loading alignment model...")
-    model_a, metadata = whisperx.load_align_model(language_code=lang, device=device)
-    
-    print("Aligning transcription with precise timestamps...")
-    result = whisperx.align(
-        result["segments"],
-        model_a,
-        metadata,
-        audio,
-        device,
-        return_char_alignments=False,
-    )
+    print(f"Detected language(s): {detected_language or 'unknown'}")
+
+    if not segments:
+        print("No speech detected.")
+        return
+
+    result = {
+        "language": language_code,
+        "segments": segments,
+    }
+
+    has_word_timing = any(segment.get("words") for segment in result["segments"])
+    if has_word_timing:
+        print("Using Qwen forced-alignment word timestamps.")
+    elif result["segments"] and language_code:
+        print(f"Loading alignment model for {language_code}...")
+        try:
+            model_a, metadata = whisperx.load_align_model(
+                language_code=language_code, device=device
+            )
+
+            print("Aligning transcription with precise timestamps...")
+            result = whisperx.align(
+                result["segments"],
+                model_a,
+                metadata,
+                audio,
+                device,
+                return_char_alignments=False,
+            )
+        except Exception as exc:
+            print(f"Alignment unavailable; writing chunk-timed subtitles: {exc}")
+    elif result["segments"]:
+        print(
+            f"No WhisperX alignment model mapping for '{detected_language}'. "
+            "Writing chunk-timed subtitles."
+        )
 
     print(f"Generating SRT file: {output_srt_path}")
     subtitle_counter = 1
@@ -200,7 +371,8 @@ def generate_srt_from_video(video_path: str, output_dir: str | None = None, devi
     print(f"Subtitles generated successfully and saved to: {output_srt_path}")
 
     del model
-    del model_a
+    if "model_a" in locals():
+        del model_a
     gc.collect()
     if device == "cuda":
         import torch
