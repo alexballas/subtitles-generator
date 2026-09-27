@@ -1,6 +1,6 @@
 # Video Subtitle Generator
 
-This script generates `.srt` subtitles using Qwen3-ASR-1.7B for transcription and Qwen3-ForcedAligner-0.6B for word-level timing. The spoken language is detected automatically. Audio is processed in 60-second chunks to keep long videos within GPU memory and preserve local timing. WhisperX remains available for audio loading and fallback alignment.
+This script generates `.srt` subtitles using Qwen3-ASR-1.7B for transcription and Qwen3-ForcedAligner-0.6B for word-level timing. The spoken language is detected automatically. Audio is split into 60-second chunks and processed in batches (4 chunks by default) to improve GPU throughput while keeping memory use bounded. WhisperX remains available for audio loading and fallback alignment.
 
 ## Prerequisites
 
@@ -40,6 +40,16 @@ By default, the script attempts to use the GPU (`cuda`) and `float16` precision.
 **Change compute type (e.g., int8, float32, float16):**
 ```bash
 ./run.sh /path/to/video.mp4 --compute_type int8
+```
+
+**Tune how many 60-second chunks are processed together:**
+```bash
+./run.sh /path/to/video.mp4 --batch-size 2
+```
+
+Lower the batch size if GPU memory runs out. To choose an attention backend explicitly, use `--attention-implementation auto`, `flash_attention_2`, or `sdpa`. The default `auto` uses FlashAttention 2 when installed in the virtual environment and otherwise falls back to the Transformers default. To install FlashAttention 2, use the CUDA/PyTorch-compatible build command:
+```bash
+./venv/bin/pip install -U flash-attn --no-build-isolation
 ```
 
 The default GPU path uses bfloat16 for Qwen3-ASR and its forced aligner. The first run downloads both Qwen model checkpoints. `--compute_type float32` forces float32 when needed.

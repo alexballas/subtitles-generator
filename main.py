@@ -1,3 +1,5 @@
+import argparse
+import importlib.util
 import whisperx
 import re
 import gc
@@ -18,6 +20,7 @@ QWEN_ASR_MODEL = "Qwen/Qwen3-ASR-1.7B"
 QWEN_FORCED_ALIGNER_MODEL = "Qwen/Qwen3-ForcedAligner-0.6B"
 QWEN_SAMPLE_RATE = 16000
 QWEN_CHUNK_SECONDS = 60
+DEFAULT_BATCH_SIZE = 4
 QWEN_MAX_NEW_TOKENS = 2048
 QWEN_TO_WHISPER_LANGUAGE = {
     "chinese": "zh",
@@ -63,22 +66,79 @@ def _qwen_language_to_whisper_code(language: str) -> str | None:
     return QWEN_TO_WHISPER_LANGUAGE.get(parts[0])
 
 
-def _load_qwen_model(device: str, compute_type: str) -> Qwen3ASRModel:
+def _load_qwen_model(
+    device: str,
+    compute_type: str,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    attention_implementation: str = "auto",
+) -> Qwen3ASRModel:
+    if batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+
     dtype = torch.float32 if device == "cpu" or compute_type == "float32" else torch.bfloat16
     device_map = "cuda:0" if device == "cuda" else "cpu"
+    flash_attention_available = (
+        device == "cuda" and importlib.util.find_spec("flash_attn") is not None
+    )
+    if attention_implementation == "auto":
+        selected_attention = "flash_attention_2" if flash_attention_available else None
+        if selected_attention is None:
+            print(
+                "FlashAttention 2 is unavailable for this run; using the Transformers default. "
+                "Install it with: pip install -U flash-attn --no-build-isolation"
+            )
+    elif attention_implementation == "flash_attention_2":
+        if not flash_attention_available:
+            raise RuntimeError(
+                "FlashAttention 2 was requested but flash-attn is not installed or CUDA is not in use. "
+                "Install it with: pip install -U flash-attn --no-build-isolation"
+            )
+        selected_attention = "flash_attention_2"
+    elif attention_implementation == "sdpa":
+        selected_attention = "sdpa"
+    else:
+        raise ValueError(f"Unsupported attention implementation: {attention_implementation}")
+
+    model_kwargs = {
+        "dtype": dtype,
+        "device_map": device_map,
+        "forced_aligner": QWEN_FORCED_ALIGNER_MODEL,
+        "forced_aligner_kwargs": {"dtype": dtype, "device_map": device_map},
+        "max_inference_batch_size": batch_size,
+        "max_new_tokens": QWEN_MAX_NEW_TOKENS,
+    }
+    if selected_attention:
+        model_kwargs["attn_implementation"] = selected_attention
+        model_kwargs["forced_aligner_kwargs"]["attn_implementation"] = selected_attention
+
     print(
         f"Loading Qwen ASR model '{QWEN_ASR_MODEL}' on {device} with dtype={dtype} "
-        f"and forced aligner '{QWEN_FORCED_ALIGNER_MODEL}'..."
+        f"and forced aligner '{QWEN_FORCED_ALIGNER_MODEL}' "
+        f"(attention={selected_attention or 'Transformers default'}, batch_size={batch_size})..."
     )
-    return Qwen3ASRModel.from_pretrained(
-        QWEN_ASR_MODEL,
-        dtype=dtype,
-        device_map=device_map,
-        forced_aligner=QWEN_FORCED_ALIGNER_MODEL,
-        forced_aligner_kwargs={"dtype": dtype, "device_map": device_map},
-        max_inference_batch_size=1,
-        max_new_tokens=QWEN_MAX_NEW_TOKENS,
-    )
+    try:
+        return Qwen3ASRModel.from_pretrained(QWEN_ASR_MODEL, **model_kwargs)
+    except Exception as exc:
+        flash_attention_error = any(
+            marker in str(exc).lower()
+            for marker in ("flash_attn", "flash attention", "flash_attention")
+        )
+        if (
+            attention_implementation != "auto"
+            or selected_attention != "flash_attention_2"
+            or not flash_attention_error
+        ):
+            raise
+
+        print(
+            f"FlashAttention 2 could not be initialized ({exc}); "
+            "retrying with the Transformers default."
+        )
+        model_kwargs.pop("attn_implementation", None)
+        model_kwargs["forced_aligner_kwargs"].pop("attn_implementation", None)
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        return Qwen3ASRModel.from_pretrained(QWEN_ASR_MODEL, **model_kwargs)
 
 
 def _normalize_aligned_token(token: str) -> str:
@@ -111,27 +171,49 @@ def _restore_transcript_punctuation(words: List[Dict], text: str) -> None:
                 break
 
 
-def _transcribe_qwen_chunks(model: Qwen3ASRModel, audio) -> tuple[List[Dict], List[str]]:
-    """Transcribe short chunks while leaving Qwen's language detection automatic."""
+def _transcribe_qwen_chunks(
+    model: Qwen3ASRModel,
+    audio,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+) -> tuple[List[Dict], List[str]]:
+    """Transcribe one-minute chunks in batches with automatic language detection."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+
     chunk_samples = QWEN_CHUNK_SECONDS * QWEN_SAMPLE_RATE
+    chunks = []
     segments = []
     detected_languages = []
 
     for chunk_start in range(0, len(audio), chunk_samples):
         chunk_end = min(chunk_start + chunk_samples, len(audio))
-        start_seconds = chunk_start / QWEN_SAMPLE_RATE
-        end_seconds = chunk_end / QWEN_SAMPLE_RATE
+        chunks.append({
+            "start": chunk_start / QWEN_SAMPLE_RATE,
+            "end": chunk_end / QWEN_SAMPLE_RATE,
+            "audio": audio[chunk_start:chunk_end],
+        })
+
+    for batch_start in range(0, len(chunks), batch_size):
+        batch = chunks[batch_start : batch_start + batch_size]
+        first_chunk = batch_start + 1
+        last_chunk = batch_start + len(batch)
         print(
-            f"Transcribing Qwen chunk {chunk_start // chunk_samples + 1} "
-            f"({format_time_srt(start_seconds)}–{format_time_srt(end_seconds)})..."
+            f"Transcribing Qwen chunks {first_chunk}–{last_chunk}/{len(chunks)} "
+            f"({format_time_srt(batch[0]['start'])}–{format_time_srt(batch[-1]['end'])})..."
         )
 
-        transcription = model.transcribe(
-            (audio[chunk_start:chunk_end], QWEN_SAMPLE_RATE),
+        transcriptions = model.transcribe(
+            [(chunk["audio"], QWEN_SAMPLE_RATE) for chunk in batch],
             return_time_stamps=True,
         )
-        if transcription:
-            transcription_result = transcription[0]
+        if len(transcriptions) != len(batch):
+            raise RuntimeError(
+                f"Qwen returned {len(transcriptions)} results for a batch of {len(batch)} chunks"
+            )
+
+        for chunk, transcription_result in zip(batch, transcriptions):
+            start_seconds = chunk["start"]
+            end_seconds = chunk["end"]
             detected_language = (transcription_result.language or "").strip()
             text = (transcription_result.text or "").strip()
             if detected_language:
@@ -274,7 +356,14 @@ def format_time_srt(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def generate_srt_from_video(video_path: str, output_dir: str | None = None, device: str = "cuda", compute_type: str = "float16"):
+def generate_srt_from_video(
+    video_path: str,
+    output_dir: str | None = None,
+    device: str = "cuda",
+    compute_type: str = "float16",
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    attention_implementation: str = "auto",
+):
     if not os.path.exists(video_path):
         print(f"Error: Video file not found at '{video_path}'")
         return
@@ -292,10 +381,19 @@ def generate_srt_from_video(video_path: str, output_dir: str | None = None, devi
     audio = whisperx.load_audio(video_path)
     duration_seconds = len(audio) / QWEN_SAMPLE_RATE
 
-    model = _load_qwen_model(device, compute_type)
+    model = _load_qwen_model(
+        device,
+        compute_type,
+        batch_size=batch_size,
+        attention_implementation=attention_implementation,
+    )
 
     print("Transcribing audio...")
-    segments, detected_languages = _transcribe_qwen_chunks(model, audio)
+    segments, detected_languages = _transcribe_qwen_chunks(
+        model,
+        audio,
+        batch_size=batch_size,
+    )
     detected_language = ",".join(detected_languages)
     language_code = None
     if len(detected_languages) == 1:
@@ -378,7 +476,13 @@ def generate_srt_from_video(video_path: str, output_dir: str | None = None, devi
         import torch
         torch.cuda.empty_cache()
 
-def process_videos_in_folder(folder_path: str, device: str = "cuda", compute_type: str = "float16"):
+def process_videos_in_folder(
+    folder_path: str,
+    device: str = "cuda",
+    compute_type: str = "float16",
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    attention_implementation: str = "auto",
+):
     video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mpg', '.mpeg'}
     
     if not os.path.exists(folder_path):
@@ -423,7 +527,9 @@ def process_videos_in_folder(folder_path: str, device: str = "cuda", compute_typ
                 video_file,
                 output_dir=None,
                 device=device,
-                compute_type=compute_type
+                compute_type=compute_type,
+                batch_size=batch_size,
+                attention_implementation=attention_implementation,
             )
             print(f"✓ Successfully processed: {video_file}")
         except Exception as e:
@@ -437,14 +543,27 @@ def process_videos_in_folder(folder_path: str, device: str = "cuda", compute_typ
 
 # --- Example Usage ---
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(description="Generate subtitles for video files in a folder or a specific video file.")
     parser.add_argument("input_path", type=str, help="Path to a video file or a folder containing video files.")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device to use for processing (cuda or cpu).")
     parser.add_argument("--compute_type", type=str, default="float16", choices=["float16", "int8", "float32"], help="Compute type to use (float16, int8, float32).")
+    parser.add_argument(
+        "--batch-size",
+        "--batch_size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Number of 1-minute audio chunks to process together (default: {DEFAULT_BATCH_SIZE}; lower if out of memory).",
+    )
+    parser.add_argument(
+        "--attention-implementation",
+        choices=("auto", "flash_attention_2", "sdpa"),
+        default="auto",
+        help="Attention backend; auto uses FlashAttention 2 when installed and falls back otherwise.",
+    )
 
     args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be a positive integer")
 
     input_path = args.input_path
     processing_device = args.device
@@ -474,7 +593,9 @@ if __name__ == "__main__":
                         input_path,
                         output_dir=None,
                         device=processing_device,
-                        compute_type=processing_compute_type
+                        compute_type=processing_compute_type,
+                        batch_size=args.batch_size,
+                        attention_implementation=args.attention_implementation,
                     )
                     print(f"✓ Successfully processed: {input_path}")
                 except Exception as e:
@@ -490,7 +611,9 @@ if __name__ == "__main__":
         process_videos_in_folder(
             input_path,
             processing_device,
-            processing_compute_type
+            processing_compute_type,
+            batch_size=args.batch_size,
+            attention_implementation=args.attention_implementation,
         )
     else:
         print(f"Error: Path '{input_path}' does not exist.")
