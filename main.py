@@ -244,18 +244,215 @@ def _transcribe_qwen_chunks(
                         "end": words[-1]["end"],
                         "text": text,
                         "words": words,
+                        "language": detected_language,
                     })
                 else:
                     segments.append({
                         "start": start_seconds,
                         "end": end_seconds,
                         "text": text,
+                        "language": detected_language,
                     })
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     return segments, list(dict.fromkeys(detected_languages))
+
+
+def _align_missing_segments(segments: List[Dict], audio, device: str) -> None:
+    """Retry alignment for chunks that Qwen transcribed without word times."""
+    by_language = {}
+    for segment in segments:
+        if segment.get("words"):
+            continue
+        language_code = _qwen_language_to_whisper_code(segment.get("language", ""))
+        if language_code:
+            by_language.setdefault(language_code, []).append(segment)
+        else:
+            print(f"No alignment language for chunk at {format_time_srt(segment['start'])}.")
+
+    for language_code, missing in by_language.items():
+        model_a = None
+        try:
+            print(f"Retrying word alignment for {len(missing)} {language_code} chunk(s)...")
+            model_a, metadata = whisperx.load_align_model(
+                language_code=language_code, device=device
+            )
+            aligned = whisperx.align(
+                missing, model_a, metadata, audio, device,
+                return_char_alignments=False,
+            )["segments"]
+            for original, replacement in zip(missing, aligned):
+                words = [
+                    word for word in replacement.get("words", [])
+                    if word.get("word") and word.get("start") is not None
+                    and word.get("end") is not None
+                    and word["end"] > word["start"]
+                ]
+                if words:
+                    original["words"] = words
+                    original["start"] = words[0]["start"]
+                    original["end"] = words[-1]["end"]
+        except Exception as exc:
+            print(f"WhisperX alignment unavailable for {language_code}: {exc}")
+        finally:
+            del model_a
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+
+def _refine_suspicious_timing(segments: List[Dict], audio) -> None:
+    """Use detected speech to correct implausible alignment timestamps."""
+    long_word_seconds = 2.5
+    isolated_gap_seconds = 2.5
+
+    def may_lead_following_phrase(words: List[Dict], index: int) -> bool:
+        word = words[index]["word"]
+        following = words[index + 1]["word"]
+        is_title = word.casefold() in {"mr.", "mrs.", "ms.", "dr."}
+        return (
+            (is_title or not word.endswith((".", "!", "?")))
+            and bool(following)
+            and (is_title or following[0].islower())
+            and (
+                is_title
+                or index == 0
+                or words[index - 1]["word"].endswith((".", "!", "?"))
+                or words[index]["start"] - words[index - 1]["end"] > isolated_gap_seconds
+            )
+        )
+
+    suspicious = any(
+        not segment.get("words") or any(
+            word["end"] - word["start"] > long_word_seconds
+            for word in segment["words"]
+        ) or any(
+            segment["words"][index + 1]["start"] - word["end"] > isolated_gap_seconds
+            and may_lead_following_phrase(segment["words"], index)
+            for index, word in enumerate(segment["words"][:-1])
+        )
+        for segment in segments
+    )
+    if not suspicious:
+        return
+
+    try:
+        from whisperx.vads.pyannote import Binarize, Pyannote
+
+        print("Checking suspicious subtitle timings against detected speech...")
+        vad = Pyannote(torch.device("cpu"), vad_onset=0.5)
+        scores = vad({
+            "waveform": torch.from_numpy(audio).unsqueeze(0),
+            "sample_rate": QWEN_SAMPLE_RATE,
+        })
+        speech = Binarize(
+            onset=0.5, offset=0.363,
+            min_duration_on=0.1, min_duration_off=0.1,
+        )(scores)
+        speech_intervals = [(region.start, region.end) for region in speech.get_timeline()]
+        del vad, scores
+    except Exception as exc:
+        print(f"Speech timing check unavailable: {exc}")
+        return
+
+    def speech_at(start: float, end: float):
+        return next((
+            (speech_start, speech_end)
+            for speech_start, speech_end in speech_intervals
+            if speech_start < end + 0.2 and speech_end > start - 0.2
+        ), None)
+
+    for segment in segments:
+        words = segment.get("words")
+        if words:
+            original_durations = {
+                id(word): word["end"] - word["start"] for word in words
+            }
+            for word in words:
+                start, end = word["start"], word["end"]
+                if end - start <= long_word_seconds:
+                    continue
+                speech_at_start = speech_at(start, min(start + 0.4, end))
+                if speech_at_start:
+                    # A later voice can occur inside a stretched word span. Keep
+                    # the start when speech exists there and trim the silent tail.
+                    corrected_end = min(end, speech_at_start[1] + 0.2)
+                    if end - corrected_end >= 0.5 and corrected_end > start:
+                        print(
+                            f"Trimmed long word end at {format_time_srt(end)} "
+                            f"to {format_time_srt(corrected_end)}: {word['word']}"
+                        )
+                        word["end"] = corrected_end
+                    continue
+                # The aligner sometimes stretches a word backward through silence.
+                # Only move its start when speech is detected near its end.
+                matching = [
+                    speech_start for speech_start, speech_end in speech_intervals
+                    if start < speech_start < end
+                    and speech_end >= end - 0.25
+                ]
+                if matching:
+                    corrected_start = max(start, matching[-1] - 0.15)
+                    if corrected_start - start >= 0.5:
+                        print(
+                            f"Moved early word start at {format_time_srt(start)} "
+                            f"to {format_time_srt(corrected_start)}: {word['word']}"
+                        )
+                        word["start"] = corrected_start
+
+            for index, (word, following) in enumerate(zip(words, words[1:])):
+                gap = following["start"] - word["end"]
+                if gap <= isolated_gap_seconds or not may_lead_following_phrase(words, index):
+                    continue
+                speech_at_old_start = speech_at(word["start"], word["end"])
+                # Speech at the old position might belong to a different line.
+                # A word stretched across a long silence is more likely to lead
+                # the following phrase, even if another voice was heard earlier.
+                stretched_before_trim = original_durations[id(word)] > long_word_seconds
+                if speech_at_old_start and stretched_before_trim and gap > 35.0:
+                    print(
+                        f"Review ambiguous word near {format_time_srt(word['start'])}: "
+                        f"{word['word']} (next word is {gap:.1f}s later)"
+                    )
+                if speech_at_old_start and (
+                    not stretched_before_trim or gap < 4.0 or gap > 35.0
+                ):
+                    continue
+                following_speech = speech_at(following["start"], following["end"])
+                if following_speech is None:
+                    continue
+
+                # A short word aligned in silence can be separated from its sentence
+                # by a large gap. Anchor it near the speech that contains the next word.
+                corrected_start = max(
+                    following_speech[0] - 0.2,
+                    following["start"] - 0.5,
+                )
+                corrected_end = max(following["start"], corrected_start + 0.12)
+                print(
+                    f"Moved isolated word from {format_time_srt(word['start'])} "
+                    f"to {format_time_srt(corrected_start)}: {word['word']}"
+                )
+                word["start"] = corrected_start
+                word["end"] = corrected_end
+            segment["start"] = words[0]["start"]
+            segment["end"] = words[-1]["end"]
+        else:
+            nearby = [
+                (speech_start, speech_end)
+                for speech_start, speech_end in speech_intervals
+                if speech_end > segment["start"] and speech_start < segment["end"]
+            ]
+            if nearby:
+                segment["start"] = max(segment["start"], nearby[0][0] - 0.15)
+                segment["end"] = min(segment["end"], nearby[-1][1] + 0.25)
+            else:
+                print(
+                    f"Could not locate speech for unaligned chunk at "
+                    f"{format_time_srt(segment['start'])}; leaving its timing unchanged."
+                )
 
 
 def split_by_pauses(segment: Dict, min_pause: float = 0.3, max_duration: float = 5.0, max_chars: int = 80) -> List[Dict]:
@@ -394,57 +591,38 @@ def generate_srt_from_video(
         audio,
         batch_size=batch_size,
     )
-    detected_language = ",".join(detected_languages)
-    language_code = None
-    if len(detected_languages) == 1:
-        language_code = _qwen_language_to_whisper_code(detected_languages[0])
+    del model
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
+    detected_language = ",".join(detected_languages)
     print(f"Detected language(s): {detected_language or 'unknown'}")
 
     if not segments:
         print("No speech detected.")
         return
 
-    result = {
-        "language": language_code,
-        "segments": segments,
-    }
-
-    has_word_timing = any(segment.get("words") for segment in result["segments"])
-    if has_word_timing:
-        print("Using Qwen forced-alignment word timestamps.")
-    elif result["segments"] and language_code:
-        print(f"Loading alignment model for {language_code}...")
-        try:
-            model_a, metadata = whisperx.load_align_model(
-                language_code=language_code, device=device
-            )
-
-            print("Aligning transcription with precise timestamps...")
-            result = whisperx.align(
-                result["segments"],
-                model_a,
-                metadata,
-                audio,
-                device,
-                return_char_alignments=False,
-            )
-        except Exception as exc:
-            print(f"Alignment unavailable; writing chunk-timed subtitles: {exc}")
-    elif result["segments"]:
-        print(
-            f"No WhisperX alignment model mapping for '{detected_language}'. "
-            "Writing chunk-timed subtitles."
-        )
+    _align_missing_segments(segments, audio, device)
+    _refine_suspicious_timing(segments, audio)
 
     print(f"Generating SRT file: {output_srt_path}")
     subtitle_counter = 1
     all_sub_segments = []
 
-    for segment in result["segments"]:
+    for segment in segments:
         all_sub_segments.extend(split_by_pauses(segment, min_pause=0.3, max_duration=5.0, max_chars=80))
 
     all_sub_segments = extend_subtitle_timing(all_sub_segments, linger_time=0.5, safety_gap=0.02)
+
+    long_subtitles = [
+        segment for segment in all_sub_segments
+        if segment["end"] - segment["start"] > 6.0
+    ]
+    if long_subtitles:
+        print(f"Review {len(long_subtitles)} subtitle(s) longer than 6 seconds:")
+        for segment in long_subtitles:
+            print(f"  {format_time_srt(segment['start'])}: {segment['text'][:60]}")
     
     with open(output_srt_path, "w", encoding="utf-8") as f:
         for sub_segment in all_sub_segments:
@@ -467,14 +645,6 @@ def generate_srt_from_video(
             f.write(f"{text}\n\n")
 
     print(f"Subtitles generated successfully and saved to: {output_srt_path}")
-
-    del model
-    if "model_a" in locals():
-        del model_a
-    gc.collect()
-    if device == "cuda":
-        import torch
-        torch.cuda.empty_cache()
 
 def process_videos_in_folder(
     folder_path: str,

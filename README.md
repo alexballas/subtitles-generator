@@ -2,6 +2,10 @@
 
 This script generates `.srt` subtitles using Qwen3-ASR-1.7B for transcription and Qwen3-ForcedAligner-0.6B for word-level timing. The spoken language is detected automatically. Audio is split into 60-second chunks and processed in batches (4 chunks by default) to improve GPU throughput while keeping memory use bounded. WhisperX remains available for audio loading and fallback alignment.
 
+If Qwen returns text for a chunk without word timestamps, the script retries alignment for that chunk with WhisperX. It checks unusually long word timings and isolated early words against detected speech to reduce subtitles appearing before a word is spoken. When alignment still fails, detected speech narrows the chunk timing where possible.
+
+These timing changes are estimates: speech detection cannot tell which word was spoken. The `Moved` and `Trimmed` log lines are review points, not confirmation that a word is correctly timed. Subtitles longer than six seconds are also listed at the end of a run, but short subtitles can still be mistimed.
+
 ## Prerequisites
 
 1.  Ensure you have Python installed.
